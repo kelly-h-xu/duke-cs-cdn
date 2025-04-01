@@ -1,0 +1,28 @@
+#!/bin/bash
+
+# Ensure a domain argument is provided
+if [ "$#" -ne 2 ] || [ "$1" != "--origin-domain" ]; then
+    echo "Command must be of format: $0 --origin-domain <domain>"
+    exit 1
+fi
+
+domain=$2
+certs_dir="certs"
+
+key_file="certs/cdn_key.pem"
+cert_file="certs/cdn_cert.pem"
+
+# Generate private key and self-signed certificate using OpenSSL 3
+openssl req -x509 -nodes -days 365 \
+    -newkey rsa:2048 \
+    -keyout "$key_file" \
+    -out "$cert_file" \
+    -subj "/CN=$domain" \
+    -addext "subjectAltName=DNS:$domain"
+
+if [ $? -eq 0 ]; then
+    echo "Certificate and key generated successfully in $certs_dir/"
+else
+    echo "Error generating certificate."
+    exit 1
+fi

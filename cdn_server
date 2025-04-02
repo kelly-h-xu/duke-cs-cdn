@@ -4,6 +4,10 @@ import argparse
 import socket
 import ssl
 import threading
+import certifi
+
+#notes: lock on sockets for testing, queue to store origin sockets? 
+#anywhere you use the thread pool, acquire the lock at the start of the function, release it at the end of the function (like in connect_to_origin)
 
 class TCP_Proxy_Server:
     def __init__(self, cdn_ip, cdn_port, origin_ip, origin_port, origin_domain):
@@ -20,72 +24,72 @@ class TCP_Proxy_Server:
         """
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain('./certs/cdn_cert.pem', './certs/cdn_key.pem')
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as cdn_sock:
-            cdn_sock.bind((self.cdn_ip, self.cdn_port))
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as cdn_sock: #change this to not use
+            cdn_sock.bind((self.cdn_ip, self.cdn_port)) #don't need to specify cdn_ip, 127.0.0.1 by default
             cdn_sock.listen(5)
             print(f"Proxy server listening on {self.cdn_ip}:{self.cdn_port}")
-            with context.wrap_socket(cdn_sock, server_side=True) as ssl_cdn_sock:
-                while True:
-                    client_socket = self.accept_client_connection(ssl_cdn_sock)
-                    self.handle_client(client_socket)
+            ssl_cdn_sock = context.wrap_socket(cdn_sock, server_side=True)  #don't use with here, close manually
+            while True: #listen for client connections to cs.duke.edu:port 
+                client_socket = self.accept_client_connection(ssl_cdn_sock)
+                origin_socket = self.connect_to_origin()
 
+                #each client should be separate thread
+                client_thread = threading.Thread(target=self.handle_connection, args=(client_socket, origin_socket))
+                client_thread.start()
+            ssl_cdn_sock.close()
+
+    """
+    Accept client connection 
+    Return client's TLS socket 
+    """
     def accept_client_connection(self, server_socket):
-        #Accept client connection;
-        #Return client's TLS socket and address
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations('./certs/cdn_cert.pem')  
-        client_conn, client_address = server_socket.accept()  
-        context.wrap_socket(client_conn, server_hostname=self.origin_domain)
+        client_conn, client_address = server_socket.accept() #provides socket object for communication with client
         print(f"Accepted connection from {client_address}")
-
 
         return client_conn
     
-    def handle_client(self, client_socket):
+    def handle_connection(self, client_socket, origin_socket):
         """
         client_socket: TLS socket for the client connection,
-        client_address: Address of the client (optional
-        """
-        origin_socket = self.connect_to_origin()
+        client_address: Address of the client (optional)
+        """  
+        # receive origin response and serve it locally (?) 
+        client_request = self.receive_client_request(client_socket)  # client_socket gets client request 
+        #TODO: modify client request (modify_request) and forward to origin server using origin_socket
+        self.modify_and_send_request(client_request, origin_socket)
+        origin_server_response = self.receive_origin_response(origin_socket)
+        #TODO: serve origin response locally 
         
-        # Create threads to relay messages bidirectionally
-        client_to_origin = threading.Thread(target=self.relay_messages, args=(client_socket, origin_socket))
-        origin_to_client = threading.Thread(target=self.relay_messages, args=(origin_socket, client_socket))
-        
-        client_to_origin.start()
-        origin_to_client.start()
-        
-        client_to_origin.join()
-        origin_to_client.join()
-        
-        client_socket.close()
-        origin_socket.close()
-        #print(f"Closed connection from {client_address}") #add back for debugging if needed
 
     def connect_to_origin(self):
         """
-        CDN acts as client, connects to the origin server over TLS and returns the socket.
+        connect an origin client to the origin server over TLS and returns the socket.
         """
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.load_verify_locations('./certs/cdn_cert.pem')  
-
-        origin_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-        origin_sock.settimeout(5)  # Prevent infinite hangs
-
-        print(f"Attempting to connect to {self.origin_ip}:{self.origin_port}...") #not working with 127.0.0.1:4443
-        origin_sock.connect((self.origin_ip, self.origin_port)) 
-        print("TCP connection established, wrapping with TLS...") 
-
-        ssl_origin_sock = context.wrap_socket(origin_sock, server_hostname=self.origin_domain)  
+        context = ssl.create_default_context() #keep for autograder 
+        context.load_verify_locations(certifi.where()) #use certifi to run locally, comment out for autograder
+        origin_client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        ssl_origin_client_sock = context.wrap_socket(origin_client_sock, server_hostname=self.origin_domain)
+        #print(f"Attempting to connect to {self.origin_domain}:{self.origin_port} with TLS...") 
+        ssl_origin_client_sock.connect((self.origin_ip, self.origin_port)) 
         print(f"Connected to origin server {self.origin_ip}:{self.origin_port} with TLS")
 
-        return ssl_origin_sock  # Return an open socket
+        return ssl_origin_client_sock  # Return an open socket
 
-    def receive_client_request(client_socket):
-        pass
-    def receive_origin_response(origin_socket):
-        pass
-    def modify_request(request_data):
+    def receive_client_request(self, client_socket):
+        data = client_socket.recv(4096)
+        if not data:
+            client_socket.close()
+        print(f"data received from client: {data}")
+        return data
+
+    def receive_origin_response(self, origin_socket):
+        data = origin_socket.recv(4096)
+        if not data:
+            origin_socket.close()
+        print(f"response received from origin: {data}")
+        return data
+
+    def modify_and_send_request(self, request_data, origin_socket):
         """
         Decode the iso-8859-1-encoded request message;
         Modify the client request;
@@ -93,22 +97,26 @@ class TCP_Proxy_Server:
         > Note that the request may already contain a Connection header.
         Forward the modified version to the origin server;
         """
-        pass
-
-    def relay_messages(self, src_socket, dst_socket):
-        """Relays messages between the source and destination sockets."""
-        while True:
-            data = src_socket.recv(4096)
-            print(data)
-            if not data:
+        request_decoded = request_data.decode("iso-8859-1")
+        headers = request_decoded.split("\r\n")
+        
+        #modify header 
+        for i in range(len(headers)):
+            if "Connection:" in headers[i]:
+                headers[i] = "Connection: close"
                 break
-            dst_socket.sendall(data)
+        modified_request = "\r\n".join(headers) + "\r\n\r\n"
+        modified_request_bytes = modified_request.encode("iso-8859-1")
+        origin_socket.sendall(modified_request_bytes)
+        print("modified and sent request")
 
 if __name__ == "__main__":
-    #make sure to pull up https://cs.duke.edu:4443 for ssl encrypted connection, and for cert to work 
-    #don't visit https://localhost:4443 !!!
-    proxy = TCP_Proxy_Server("127.0.0.1", 4443, "127.0.0.1", 5000, "cs.duke.edu")
+    #def __init__(self, cdn_ip, cdn_port, origin_ip, origin_port):
+    ORIGIN_ADDR = "152.3.103.25"  #IP address of real cs.duke.edu 
+    ORIGIN_PORT = 443 #always 443 for https
+    proxy = TCP_Proxy_Server("127.0.0.1", 4443, ORIGIN_ADDR, 443, "cs.duke.edu")
     proxy.start()
 
-    #origin server serves content. is 127.0.0.1
+    #make sure to pull up https://cs.duke.edu:4443 for ssl encrypted connection, and for cert to work 
+    #don't visit https://localhost:4443 !!!
 

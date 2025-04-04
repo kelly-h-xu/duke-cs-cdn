@@ -9,6 +9,9 @@ import certifi
 #notes: lock on sockets for testing, queue to store origin sockets? 
 #anywhere you use the thread pool, acquire the lock at the start of the function, release it at the end of the function (like in connect_to_origin)
 
+#for cache, only store if html, jpg, png
+#max age = 0 is another way of saying no store 
+
 class TCP_Proxy_Server:
     def __init__(self, cdn_ip, cdn_port, origin_ip, origin_port, origin_domain):
         self.cdn_ip = cdn_ip
@@ -24,19 +27,19 @@ class TCP_Proxy_Server:
         """
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain('./certs/cdn_cert.pem', './certs/cdn_key.pem')
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as cdn_sock: #change this to not use
-            cdn_sock.bind((self.cdn_ip, self.cdn_port)) #don't need to specify cdn_ip, 127.0.0.1 by default
-            cdn_sock.listen(5)
-            print(f"Proxy server listening on {self.cdn_ip}:{self.cdn_port}")
-            ssl_cdn_sock = context.wrap_socket(cdn_sock, server_side=True)  #don't use with here, close manually
-            while True: #listen for client connections to cs.duke.edu:port 
-                client_socket = self.accept_client_connection(ssl_cdn_sock)
-                origin_socket = self.connect_to_origin()
+        cdn_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
+        cdn_sock.bind((self.cdn_ip, self.cdn_port)) #don't need to specify cdn_ip, 127.0.0.1 by default
+        cdn_sock.listen(5)
+        print(f"Proxy server listening on {self.cdn_ip}:{self.cdn_port}")
+        ssl_cdn_sock = context.wrap_socket(cdn_sock, server_side=True)  #don't use with here, close manually
+        while True: #listen for client connections to cs.duke.edu:port 
+            client_socket = self.accept_client_connection(ssl_cdn_sock)
+            origin_socket = self.connect_to_origin()
 
-                #each client should be separate thread
-                client_thread = threading.Thread(target=self.handle_connection, args=(client_socket, origin_socket))
-                client_thread.start()
-            ssl_cdn_sock.close()
+            #each client should be separate thread
+            client_thread = threading.Thread(target=self.handle_connection, args=(client_socket, origin_socket))
+            client_thread.start()
+        ssl_cdn_sock.close()
 
     """
     Accept client connection 
@@ -53,12 +56,23 @@ class TCP_Proxy_Server:
         client_socket: TLS socket for the client connection,
         client_address: Address of the client (optional)
         """  
-        # receive origin response and serve it locally (?) 
-        client_request = self.receive_client_request(client_socket)  # client_socket gets client request 
-        #TODO: modify client request (modify_request) and forward to origin server using origin_socket
-        self.modify_and_send_request(client_request, origin_socket)
-        origin_server_response = self.receive_origin_response(origin_socket)
-        #TODO: serve origin response locally 
+        # Thread 1: Forward data from client to origin
+        client_to_origin = threading.Thread(target=self.relay_messages, args=(client_socket, origin_socket, True))
+
+        # Thread 2: Forward data from origin to client
+        origin_to_client = threading.Thread(target=self.relay_messages, args=(origin_socket, client_socket, False))
+
+        #Start threads (threads should stop when they have nothing left to do)
+        client_to_origin.start()
+        origin_to_client.start()
+
+
+        # # receive origin response and serve it locally (?) 
+        # client_request = self.receive_client_request(client_socket)  # client_socket gets client request 
+        # #TODO: modify client request (modify_request) and forward to origin server using origin_socket
+        # self.modify_and_send_request(client_request, origin_socket)
+        # origin_server_response = self.receive_origin_response(origin_socket)
+        # #TODO: serve origin response locally 
         
 
     def connect_to_origin(self):
@@ -75,19 +89,17 @@ class TCP_Proxy_Server:
 
         return ssl_origin_client_sock  # Return an open socket
 
-    def receive_client_request(self, client_socket):
-        data = client_socket.recv(4096)
-        if not data:
-            client_socket.close()
-        print(f"data received from client: {data}")
-        return data
-
-    def receive_origin_response(self, origin_socket):
-        data = origin_socket.recv(4096)
-        if not data:
-            origin_socket.close()
-        print(f"response received from origin: {data}")
-        return data
+    #do diff things depending on if src_socket is client (modify and send request) or origin (just send request)
+    #src_is_client is a boolean that is true if src_socket is client socket
+    def relay_messages(self, src_socket, dst_socket, src_is_client):
+        while True:
+            data = src_socket.recv(4096)  # Receive data from source
+            if not data:
+                break  # If no data, connection is closed
+            if src_is_client:
+                self.modify_and_send_request(data, dst_socket)
+            else:
+                dst_socket.sendall(data)  # Forward data to destination
 
     def modify_and_send_request(self, request_data, origin_socket):
         """
@@ -111,10 +123,24 @@ class TCP_Proxy_Server:
         print("modified and sent request")
 
 if __name__ == "__main__":
-    #def __init__(self, cdn_ip, cdn_port, origin_ip, origin_port):
+    #Parse command line args---------------------
+    parser = argparse.ArgumentParser(description="CDN Server")
+
+    parser.add_argument('-p', '--port', type=int, required=True,
+                        help='Port number to run the CDN server on')
+    parser.add_argument('-d', '--domain', required=True,
+                        help='Origin domain to fetch resources from')
+
+    args = parser.parse_args()
+    cdn_port = args.port
+    domain = args.domain
+
+    print(f"Starting CDN server on port {cdn_port} with origin domain {domain}")
+
+    #Start CDN-----------------------------
     ORIGIN_ADDR = "152.3.103.25"  #IP address of real cs.duke.edu 
     ORIGIN_PORT = 443 #always 443 for https
-    proxy = TCP_Proxy_Server("127.0.0.1", 4443, ORIGIN_ADDR, 443, "cs.duke.edu")
+    proxy = TCP_Proxy_Server("127.0.0.1", cdn_port, ORIGIN_ADDR, 443, domain)
     proxy.start()
 
     #make sure to pull up https://cs.duke.edu:4443 for ssl encrypted connection, and for cert to work 

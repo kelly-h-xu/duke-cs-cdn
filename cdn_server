@@ -4,6 +4,8 @@ import argparse
 import socket
 import ssl
 import threading
+import multiprocessing
+from collections import deque
 import certifi
 
 #notes: lock on sockets for testing, queue to store origin sockets? 
@@ -20,151 +22,158 @@ class TCP_Proxy_Server:
         self.origin_port = origin_port
         self.origin_domain = origin_domain
         self.debug = debug #True for more informative print statements
-        self.content_len = 0
-        self.http_status = 200
+        #self.thread_pool = multiprocessing.pool.ThreadPool(processes=5)
+        self.lock = threading.Lock()
+        self.connection_pool = deque() #queue to store origin sockets
 
-    def start(self):
-        """
+     """
         Starts the proxy server/cdn socket and listens for client connections.
         Uses TLS
-        """
+    """
+    def start(self):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain('./certs/cdn_cert.pem', './certs/cdn_key.pem')
         cdn_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-        cdn_sock.bind((self.cdn_ip, self.cdn_port)) #don't need to specify cdn_ip, 127.0.0.1 by default
+        cdn_sock.bind((self.cdn_ip, self.cdn_port)) 
         cdn_sock.listen(5)
         if debug:
             print(f"Proxy server listening on {self.cdn_ip}:{self.cdn_port}")
-        ssl_cdn_sock = context.wrap_socket(cdn_sock, server_side=True)  #don't use with here, close manually
+        ssl_cdn_sock = context.wrap_socket(cdn_sock, server_side=True)  
         while True: #listen for client connections to cs.duke.edu:port 
             client_socket, client_address = ssl_cdn_sock.accept()
             origin_socket = self.connect_to_origin()
-
-            """
-            Reuse existing connection if available and not yet closed.
-            > Otherwise, create a new connection.
-            """
             client_thread = threading.Thread(target=self.handle_connection, args=(client_socket, origin_socket, client_address))
             client_thread.start()
         ssl_cdn_sock.close()
 
   
+    """
+    If after the message relaying, the origin socket is still active, release it back to the pool
+    Always close client socket, call release_connection method for origin_socket
+    """  
     def handle_connection(self, client_socket, origin_socket, client_address):
-        """
-        Release the connection back to the pool after use;
-        """  
-        # Thread 1: Forward data from client to origin
-        client_to_origin = threading.Thread(target=self.relay_messages, args=(client_socket, origin_socket, True, client_address))
+        #get rid of 2 back and forth threads and just do it in 1 
+        self.relay_messages(client_socket, origin_socket, True, client_address)
+        self.relay_messages(origin_socket, client_socket, False, client_address)
 
-        # Thread 2: Forward data from origin to client
-        origin_to_client = threading.Thread(target=self.relay_messages, args=(origin_socket, client_socket, False, client_address))
+        # If origin socket valid, return it to the pool
+        if origin_socket.fileno != -1:
+            with self.lock:
+                self.connection_pool.append(origin_socket) 
+                if self.debug:
+                    print("Connection returned to pool")
 
-        #Start threads (threads should stop when they have nothing left to do)
-        client_to_origin.start()
-        origin_to_client.start()
-
-        client_to_origin.join()
-        origin_to_client.join()
-
-        # client_socket.close()
-        # origin_socket.close()
-
-        return
+        #close your sockets!!!
+        client_socket.close()
+        self.release_connection(origin_socket)
         
-
+    
+    """
+    Try to reuse an existing persistent connection/socket to the origin.
+    If none are available or valid, establish a new one.
+    """
     def connect_to_origin(self):
-        """
-        connect an origin client to the origin server over TLS and returns the socket.
-        """
+        with self.lock:
+            while self.connection_pool:
+                origin_sock = self.connection_pool.popleft()
+                if origin_sock.fileno() != -1:
+                    return origin_sock
+                else:
+                    if debug:
+                        print("Stale origin connection detected, discarding")
+                    origin_sock.close()
+
+        #if need to create a new socket 
         context = ssl.create_default_context() #keep for autograder 
-        context.load_verify_locations(certifi.where()) #use certifi to run locally, comment out for autograder
+        #context.load_verify_locations(certifi.where()) #use certifi to run locally, comment out for autograder
         origin_client_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         ssl_origin_client_sock = context.wrap_socket(origin_client_sock, server_hostname=self.origin_domain)
         ssl_origin_client_sock.connect((self.origin_ip, self.origin_port)) 
         if debug:
             print(f"Connected to origin server {self.origin_ip}:{self.origin_port} with TLS")
+        
+        return ssl_origin_client_sock  # Return a new open socket
 
-        return ssl_origin_client_sock  # Return an open socket
 
     #do diff things depending on if src_socket is client (modify and send request) or origin (just send request)
     #src_is_client is a boolean that is true if src_socket is client socket
+     
+    """
+    Pass messages from client to origin and origin to client
+    If src_is_client, modify client request before sending to origin. Also, call the print for get requests
+    If not src_is_client (aka src is origin), just send the origin response. to the client
+    """
     def relay_messages(self, src_socket, dst_socket, src_is_client, client_address):
-        while True:
-            data = src_socket.recv(4096)  # Receive data from source
-            if not data:
-                #src_socket.shutdown(SHUT_WR) #source socket can read but not write data TODO: this causes an error when uncommented
-                break  
-            if src_is_client: #send client request to origin server 
-                #print("sending client request to origin server")
-                #print(data)
-                request_headers, request_body = self.separate_request(data)
-                self.print_get_request(request_headers, client_address, self.content_len)
-                self.modify_and_send_request(request_headers, request_body, dst_socket)
-            else:
-                #print("sending origin response to client")
-                #print(data)
-                request_headers, request_body = self.separate_request(data)
-                self.content_len = self.get_content_length(request_headers)
-                #self.http_status = self.get_status_code(request_headers)
-                dst_socket.sendall(data)  # send origin response to client
+        #First: receive until we've definitely gotten all headers, but not necessarily all body
+        buffer = b''
+        while b"\r\n\r\n" not in buffer: 
+            buffer += src_socket.recv(4096)  # Receive data from source
+        headers_raw, body_raw = buffer.split(b"\r\n\r\n", 1)
+        headers_decoded = headers_raw.decode("iso-8859-1").split("\r\n") #decoded list of headers
+        if debug:
+            print(f"headers are {headers_decoded}")
+        content_len = self.get_content_length(headers_decoded) #get content length for next step
 
-    #separates request into headers (list) and body (string), empty string for body if no body 
-    def separate_request(self, request_data):
-        request_decoded = request_data.decode("iso-8859-1")
-        request_split = request_decoded.split("\r\n\r\n")
-        request_headers = request_split[0].split("\r\n")
-
-        #not every request will have a body
-        request_body = ""
-        if len(request_split) > 1: 
-            request_body = request_split[1]
-
-        return request_headers, request_body
+        #Second: receive until we've definitely gotten all body
+        while len(body_raw) < content_len:
+            body_raw += src_socket.recv(4096)
+        if debug:
+            body_decoded = body_raw.decode("iso-8859-1")
+            print(f"body is {body_decoded}")
+        full_request = headers_raw + b"\r\n\r\n" + body_raw
+        if src_is_client: #send client request to origin server 
+            if debug:
+                print("sending client request to origin server")
+                print(full_request)
+            self.modify_and_send_request(headers_decoded, body_raw, dst_socket)
+            self.print_get_request(headers_decoded, client_address, content_len)
+        else:
+            if debug:
+                print("sending origin response to client")
+            dst_socket.sendall(full_request)  # send origin response to client
     
+    """
+    Get content length from the content length header
+    """
     def get_content_length(self, request_headers):
-        print(request_headers)
+        if debug:
+            print(f"request_headers are {request_headers}")
         for header in request_headers:
-            if header.lower().startswith('content-length:'):
-                #print(f"content length header is {header}")
-                return header.split(':')[1]
-        #print("content length header not found")
+            if 'content-length' in header.lower():
+                if debug:
+                    print(f"content length header is {header}")
+                value = header.split(':')[1].strip()
+                return int(value) if value.isdigit() else 0
+        if debug:
+            print("content length header not found")
         return 0
     
-    # # Helper function to get status code from response headers
-    # def get_status_code(self, headers):
-    #     # The status code is located after the HTTP version (e.g., 'HTTP/1.1 200 OK')
-    #     status_line = headers[0]  # The first line contains the status code
-    #     status_code = status_line.split(" ")[1]  # The status code is the second part of the status line
-    #     return int(status_code)  # Convert the status code to an integer
-    
+    """
+    Print get requests 
+    """
     def print_get_request(self, request_headers, client_address, content_length):
         print(f"{client_address[0]}\t{request_headers[0]}\t{self.origin_domain}\t{content_length}")
     
-    def modify_and_send_request(self, request_headers, request_body, origin_socket):
-        """
-        Decode the iso-8859-1-encoded request message;
-        Modify the client request;
-        > E.g. add a Connection: close header to the request.
-        > Note that the request may already contain a Connection header.
-        Forward the modified version to the origin server;
-
-        Determine the end of response by `Content-Length` header, which
-        > specifies the length of the **response body**. You may assume this
-        > header is always present for a successful response (status code 200).
-        > In case of an error, this header may not present if the response does
-        > not contain a body.
-        """
-        #modify header 
+    
+    """
+    modify header by adding Connection: keep-alive if wasn't there before, or changing Connection header to keep-alive if was there before
+    """
+    def modify_and_send_request(self, request_headers, request_body_raw, origin_socket):
+        #modify header, 2 cases (alr has Connection header, doesn't alr have Connection header) 
+        connection_header_flag = False
         for i in range(len(request_headers)):
             if "Connection:" in request_headers[i]:
                 request_headers[i] = "Connection: keep-alive"
+                connection_header_flag = False
                 break
-        modified_request = "\r\n".join(request_headers) + "\r\n\r\n" + request_body
-        modified_request_bytes = modified_request.encode("iso-8859-1")
-        origin_socket.sendall(modified_request_bytes)
+        if not connection_header_flag:
+            request_headers.append("Connection: keep-alive")
+
+        modified_headers = "\r\n".join(request_headers).encode("iso-8859-1")
+        modified_request = modified_headers + b"\r\n\r\n" + request_body_raw
+        origin_socket.sendall(modified_request)
         if debug:
             print("modified and sent request")
-
 
 
     def release_connection(self, origin_socket):
@@ -175,23 +184,38 @@ if __name__ == "__main__":
     debug = False
 
     #Parse command line args---------------------
+    #./cdn_server --cdn-port 9443 --origin-domain cs356-p3.localhost --origin-addr 127.0.0.1 --origin-port 443
     parser = argparse.ArgumentParser(description="CDN Server")
 
-    parser.add_argument('-p', '--port', type=int, required=True,
+    parser.add_argument('-p', '--cdn-port', type=int, required=True,
                         help='Port number to run the CDN server on')
-    parser.add_argument('-d', '--domain', required=True,
+    parser.add_argument('-d', '--origin-domain', required=True,
                         help='Origin domain to fetch resources from')
+    parser.add_argument('-oa', '--origin-addr', required=True,
+                        help='usually localhost')
+    parser.add_argument('-op', '--origin-port', type=int, required=True,
+                        help='usually 443')
+
 
     args = parser.parse_args()
-    cdn_port = args.port
-    domain = args.domain
+    cdn_port = args.cdn_port
+    domain = args.origin_domain
+    origin_addr = args.origin_addr
+    origin_port = args.origin_port
 
-    print(f"Starting CDN server on port {cdn_port} with origin domain {domain}")
+
+    if debug:
+        print(f"Starting CDN server on port {cdn_port} with origin domain {domain}")
 
     #Start CDN-----------------------------
-    ORIGIN_ADDR = "152.3.103.25"  #IP address of real cs.duke.edu 
-    ORIGIN_PORT = 443 #always 443 for https
-    proxy = TCP_Proxy_Server("127.0.0.1", cdn_port, ORIGIN_ADDR, 443, domain, debug)
+    ORIGIN_ADDR = "152.3.103.25"  #IP address of real cs.duke.edu, used to run locally
+
+    #uncomment for autograder 
+    #def __init__(self, cdn_ip, cdn_port, origin_ip, origin_port, origin_domain, debug):
+    proxy = TCP_Proxy_Server("127.0.0.1", cdn_port, origin_addr, origin_port, domain, debug)
+
+    #uncomment to run locally
+    #proxy = TCP_Proxy_Server("127.0.0.1", cdn_port, ORIGIN_ADDR, origin_port, domain, debug) #uncomment to run locally
     proxy.start()
 
     #make sure to pull up https://cs.duke.edu:4443 for ssl encrypted connection, and for cert to work 

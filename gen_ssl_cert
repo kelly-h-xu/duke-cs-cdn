@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # Ensure a domain argument is provided
-if [ "$#" -ne 2 ] || [ "$1" != "--origin-domain" ]; then
-    echo "Command must be of format: $0 --origin-domain <domain>"
-    exit 1
-fi
+# if [ "$#" -ne 2 ] || [ "$1" != "--origin-domain" ]; then
+#     echo "Command must be of format: $0 --origin-domain <domain>"
+#     exit 1
+# fi
 
 domain=$2
 certs_dir="certs"
@@ -18,11 +18,11 @@ openssl req -x509 -nodes -days 365 \
     -keyout "$key_file" \
     -out "$cert_file" \
     -subj "/CN=$domain" \
-    -addext "subjectAltName=DNS:$domain"
+    -addext "subjectAltName=DNS:$domain" #maybe change to ${domain}
 
-if [ $? -eq 0 ]; then
-    echo "Certificate and key generated successfully in $certs_dir/"
-else
-    echo "Error generating certificate."
-    exit 1
-fi
+# if [ $? -eq 0 ]; then
+#     echo "Certificate and key generated successfully in $certs_dir/"
+# else
+#     echo "Error generating certificate."
+#     exit 1
+# fi

@@ -1,1 +1,1 @@
-# cs356-project3
+# CDN edge server for cs.duke.edu
